@@ -268,6 +268,34 @@ class NetworkTrainer:
         # with noise offset and/or multires noise if specified
         noise, noisy_latents, timesteps = loss_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
 
+        # For inpainting models: concatenate [noisy_latents, mask, masked_latents] -> 9-channel UNet input
+        def build_unet_input(x):
+            if batch.get("masked_latents") is None:
+                return x
+            mask = torch.nn.functional.interpolate(batch["masks"].to(weight_dtype), size=x.shape[2:])
+            return torch.cat([x, mask, batch["masked_latents"].to(weight_dtype)], dim=1)
+
+        # DREAM: rectify the noisy input / noise with the model's own (no-grad) prediction. Training only,
+        # so that validation loss stays comparable with non-DREAM runs.
+        if getattr(args, "dream_training", False) and is_train:
+            keep_mask = None
+            if "custom_attributes" in batch:
+                # differential output preservation samples get their target from the prior; leave them as-is
+                keep_mask = torch.tensor(
+                    [bool(ca.get("diff_output_preservation", False)) for ca in batch["custom_attributes"]],
+                    device=latents.device,
+                )
+
+            def dream_predict(x):
+                with accelerator.autocast():
+                    return self.call_unet(
+                        args, accelerator, unet, build_unet_input(x), timesteps, text_encoder_conds, batch, weight_dtype
+                    )
+
+            noise, noisy_latents = loss_util.apply_dream(
+                args, noise_scheduler, noise, noisy_latents, timesteps, dream_predict, keep_mask
+            )
+
         # ensure the hidden state will require grad
         if args.gradient_checkpointing:
             for x in noisy_latents:
@@ -275,13 +303,7 @@ class NetworkTrainer:
             for t in text_encoder_conds:
                 t.requires_grad_(True)
 
-        # For inpainting models: concatenate [noisy_latents, mask, masked_latents] -> 9-channel UNet input
-        unet_latents = noisy_latents
-        if batch.get("masked_latents") is not None:
-            mask = torch.nn.functional.interpolate(
-                batch["masks"].to(weight_dtype), size=noisy_latents.shape[2:]
-            )
-            unet_latents = torch.cat([noisy_latents, mask, batch["masked_latents"].to(weight_dtype)], dim=1)
+        unet_latents = build_unet_input(noisy_latents)
 
         # Predict the noise residual
         with torch.set_grad_enabled(is_train), accelerator.autocast():
@@ -569,6 +591,11 @@ class NetworkTrainer:
             "ss_min_snr_gamma": args.min_snr_gamma,
             "ss_scale_weight_norms": args.scale_weight_norms,
             "ss_ip_noise_gamma": args.ip_noise_gamma,
+            "ss_immiscible_noise_k": getattr(args, "immiscible_noise_k", None),
+            "ss_dream_training": bool(getattr(args, "dream_training", False)),
+            "ss_dream_detail_preservation": (
+                getattr(args, "dream_detail_preservation", None) if getattr(args, "dream_training", False) else None
+            ),
             "ss_debiased_estimation": bool(args.debiased_estimation_loss),
             "ss_noise_offset_random_strength": args.noise_offset_random_strength,
             "ss_ip_noise_gamma_random_strength": args.ip_noise_gamma_random_strength,
@@ -900,7 +927,13 @@ class NetworkTrainer:
     def train(self, args):
         session_id = random.randint(0, 2**32)
         training_started_at = time.time()
-        args_util.verify_training_args(args)
+        args_util.verify_training_args(args, supports_dream=True)
+        if getattr(args, "dream_training", False) and (
+            type(self).get_noise_pred_and_target is not NetworkTrainer.get_noise_pred_and_target
+        ):
+            raise ValueError(
+                f"--dream_training is not supported by {type(self).__name__} / {type(self).__name__}は--dream_trainingに対応していません"
+            )
         accelerator_setup.prepare_dataset_args(args, True)
         deepspeed_utils.prepare_deepspeed_args(args)
         setup_logging(args, reset=True)

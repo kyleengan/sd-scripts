@@ -6,7 +6,9 @@ trainer:
 - :func:`get_timesteps` — sample diffusion timesteps for a batch.
 - :func:`get_noise_noisy_latents_and_timesteps` — sample noise + timestep
   and produce noisy latents (with noise-offset / multires-noise / IP-noise
-  variants applied).
+  variants applied, and optional immiscible KNN noise pairing).
+- :func:`apply_dream` — DREAM rectification of the noisy input / noise target
+  using one extra no-grad model prediction.
 - :func:`get_huber_threshold_if_needed` — per-timestep Huber/Smooth-L1
   threshold schedule (exponential / SNR / constant).
 - :func:`conditional_loss` — dispatch over ``l2 / l1 / huber / smooth_l1``.
@@ -17,7 +19,7 @@ module.
 """
 
 import math
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -37,7 +39,12 @@ def get_noise_noisy_latents_and_timesteps(
     args, noise_scheduler, latents: torch.FloatTensor
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
     # Sample noise that we'll add to the latents
-    noise = torch.randn_like(latents, device=latents.device)
+    immiscible_k = getattr(args, "immiscible_noise_k", None)
+    if immiscible_k is not None and immiscible_k > 1:
+        # immiscible pairing: pick the nearest of k noise candidates for each latent
+        noise = custom_train_functions.immiscible_knn_noise(latents, immiscible_k)
+    else:
+        noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
         if args.noise_offset_random_strength:
             noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
@@ -70,6 +77,61 @@ def get_noise_noisy_latents_and_timesteps(
     noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.cpu()
 
     return noise, noisy_latents, timesteps
+
+
+@torch.no_grad()
+def apply_dream(
+    args,
+    noise_scheduler,
+    noise: torch.Tensor,
+    noisy_latents: torch.Tensor,
+    timesteps: torch.Tensor,
+    predict_fn: Callable[[torch.Tensor], torch.Tensor],
+    keep_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    DREAM: Diffusion Rectification and Estimation-Adaptive Models (Zhou et al., CVPR 2024, arXiv 2312.00210).
+
+    Runs one extra no-grad forward pass and moves the training input/target toward the model's own
+    prediction, reducing the train/sampling mismatch (exposure bias):
+
+        lambda_t = sqrt(1 - alpha_bar_t) ** p
+        delta    = lambda_t * sg(noise - eps_hat)
+        x_t'     = x_t + sqrt(1 - alpha_bar_t) * delta
+        noise'   = noise + delta          (the target is built from noise' as usual)
+
+    eps_hat is the model output for eps-prediction; for v-prediction it is recovered as
+    eps_hat = sqrt(alpha_bar) * v_hat + sqrt(1 - alpha_bar) * x_t.
+
+    Args:
+        predict_fn: maps noisy latents (same shape as ``noisy_latents``) to the raw model output.
+        keep_mask: optional bool tensor (B,) of samples to leave unchanged (e.g. differential output preservation).
+
+    Returns:
+        (noise', noisy_latents'), with the dtypes of the inputs.
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod.cpu()
+    alpha_bar = alphas_cumprod[timesteps.cpu()].to(device=noisy_latents.device, dtype=torch.float32)
+    alpha_bar = alpha_bar.view(-1, *([1] * (noisy_latents.ndim - 1)))
+    sqrt_alpha_bar = alpha_bar.sqrt()
+    sqrt_one_minus_alpha_bar = (1.0 - alpha_bar).sqrt()
+
+    p = getattr(args, "dream_detail_preservation", 1.0)
+    dream_lambda = sqrt_one_minus_alpha_bar**p
+
+    model_output = predict_fn(noisy_latents).float()
+    if args.v_parameterization:
+        eps_hat = sqrt_alpha_bar * model_output + sqrt_one_minus_alpha_bar * noisy_latents.float()
+    else:
+        eps_hat = model_output
+
+    delta = dream_lambda * (noise.float() - eps_hat)
+    if keep_mask is not None:
+        delta = delta * (~keep_mask).to(delta.dtype).view(-1, *([1] * (delta.ndim - 1)))
+
+    new_noisy_latents = (noisy_latents.float() + sqrt_one_minus_alpha_bar * delta).to(noisy_latents.dtype)
+    new_noise = (noise.float() + delta).to(noise.dtype)
+    return new_noise, new_noisy_latents
 
 
 def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler) -> Optional[torch.Tensor]:

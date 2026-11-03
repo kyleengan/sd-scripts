@@ -104,7 +104,7 @@ def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
 
 
 def train(args):
-    args_util.verify_training_args(args)
+    args_util.verify_training_args(args, supports_dream=True)
     accelerator_setup.prepare_dataset_args(args, True)
     sdxl_train_util.verify_sdxl_training_args(args)
     deepspeed_utils.prepare_deepspeed_args(args)
@@ -707,6 +707,7 @@ def train(args):
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
 
+                inpaint_cond = None
                 if batch["masks"] is not None:
                     with torch.no_grad():
                         masked_latents = vae.encode(
@@ -718,11 +719,27 @@ def train(args):
                         mask = torch.nn.functional.interpolate(
                             batch["masks"].to(weight_dtype), size=latents.shape[2:]
                         )
-                    noisy_latents = torch.cat([noisy_latents, mask, masked_latents], dim=1)
+                    inpaint_cond = (mask, masked_latents)
+
+                def build_unet_input(x):
+                    if inpaint_cond is None:
+                        return x
+                    return torch.cat([x, *inpaint_cond], dim=1)
+
+                # DREAM: rectify the noisy input / noise with the model's own (no-grad) prediction
+                if args.dream_training:
+
+                    def dream_predict(x):
+                        with accelerator.autocast():
+                            return unet(build_unet_input(x), timesteps, text_embedding, vector_embedding)
+
+                    noise, noisy_latents = loss_util.apply_dream(
+                        args, noise_scheduler, noise, noisy_latents, timesteps, dream_predict
+                    )
 
                 # Predict the noise residual
                 with accelerator.autocast():
-                    noise_pred = unet(noisy_latents, timesteps, text_embedding, vector_embedding)
+                    noise_pred = unet(build_unet_input(noisy_latents), timesteps, text_embedding, vector_embedding)
 
                 if args.v_parameterization:
                     # v-parameterization training

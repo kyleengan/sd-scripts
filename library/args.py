@@ -481,6 +481,29 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="Use random strength between 0~ip_noise_gamma for input perturbation noise."
         + "/ input perturbation noiseにおいて、0からip_noise_gammaの間でランダムな強度を使用します。",
     )
+    parser.add_argument(
+        "--immiscible_noise_k",
+        type=int,
+        default=None,
+        help="enable immiscible noise pairing (Improved Immiscible Diffusion, KNN): sample k noises per latent and use the nearest one."
+        + " around 4-8 is a reasonable start (disabled if None or 1)"
+        + " / immiscible noise pairing (KNN) を有効にする：latentごとにk個のノイズを生成し最も近いものを使用する。4-8程度から試すとよい（Noneまたは1で無効）",
+    )
+    parser.add_argument(
+        "--dream_training",
+        action="store_true",
+        help="enable DREAM training (arXiv 2312.00210): rectify the noisy input/target with the model's own prediction."
+        + " adds one no-grad forward pass per step. supported by sdxl_train.py, sdxl_train_network.py and train_network.py"
+        + " / DREAM学習を有効にする：モデル自身の予測で入力とターゲットを補正する。1ステップごとに勾配なしのforwardが1回追加される。"
+        + "sdxl_train.py、sdxl_train_network.py、train_network.pyで対応",
+    )
+    parser.add_argument(
+        "--dream_detail_preservation",
+        type=float,
+        default=1.0,
+        help="DREAM exponent p in lambda_t = sqrt(1 - alpha_bar_t)^p (default 1.0, the paper's best)"
+        + " / DREAMの lambda_t = sqrt(1 - alpha_bar_t)^p の指数p（デフォルト1.0、論文での最良値）",
+    )
     # parser.add_argument(
     #     "--perlin_noise",
     #     type=int,
@@ -865,7 +888,7 @@ def verify_command_line_training_args(args: argparse.Namespace):
         )
 
 
-def verify_training_args(args: argparse.Namespace):
+def verify_training_args(args: argparse.Namespace, supports_dream: bool = False):
     r"""
     Verify training arguments. Also reflect highvram option to global variable
     学習用引数を検証する。あわせて highvram オプションの指定をグローバル変数に反映する
@@ -909,6 +932,21 @@ def verify_training_args(args: argparse.Namespace):
     #     raise ValueError(
     #         "perlin_noise and multires_noise_iterations cannot be enabled at the same time / perlin_noiseとmultires_noise_iterationsを同時に有効にできません"
     #     )
+
+    immiscible_k = getattr(args, "immiscible_noise_k", None)
+    if immiscible_k is not None:
+        if immiscible_k < 1:
+            raise ValueError("immiscible_noise_k must be >= 1 / immiscible_noise_kは1以上である必要があります")
+        if immiscible_k == 1:
+            logger.info("immiscible_noise_k=1 disables immiscible noise pairing / immiscible_noise_k=1のためimmiscible noise pairingは無効です")
+
+    if getattr(args, "dream_training", False) and not supports_dream:
+        raise ValueError(
+            "--dream_training is not supported by this script (use sdxl_train.py, sdxl_train_network.py or train_network.py)"
+            + " / このスクリプトは--dream_trainingに対応していません（sdxl_train.py、sdxl_train_network.py、train_network.pyを使用してください）"
+        )
+    if getattr(args, "dream_training", False) and getattr(args, "dream_detail_preservation", 1.0) < 0:
+        raise ValueError("dream_detail_preservation must be >= 0 / dream_detail_preservationは0以上である必要があります")
 
     if args.adaptive_noise_scale is not None and args.noise_offset is None:
         raise ValueError("adaptive_noise_scale requires noise_offset / adaptive_noise_scaleを使用するにはnoise_offsetが必要です")
