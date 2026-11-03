@@ -3965,6 +3965,29 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="Use random strength between 0~ip_noise_gamma for input perturbation noise."
         + "/ input perturbation noiseにおいて、0からip_noise_gammaの間でランダムな強度を使用します。",
     )
+    parser.add_argument(
+        "--immiscible_noise_k",
+        type=int,
+        default=None,
+        help="enable immiscible noise pairing (Improved Immiscible Diffusion, KNN): sample k noises per latent and use the nearest one."
+        + " around 4-8 is a reasonable start (disabled if None or 1)"
+        + " / immiscible noise pairing (KNN) を有効にする：latentごとにk個のノイズを生成し最も近いものを使用する。4-8程度から試すとよい（Noneまたは1で無効）",
+    )
+    parser.add_argument(
+        "--dream_training",
+        action="store_true",
+        help="enable DREAM training (arXiv 2312.00210): rectify the noisy input/target with the model's own prediction."
+        + " adds one no-grad forward pass per step. supported by sdxl_train.py, sdxl_train_network.py and train_network.py"
+        + " / DREAM学習を有効にする：モデル自身の予測で入力とターゲットを補正する。1ステップごとに勾配なしのforwardが1回追加される。"
+        + "sdxl_train.py、sdxl_train_network.py、train_network.pyで対応",
+    )
+    parser.add_argument(
+        "--dream_detail_preservation",
+        type=float,
+        default=1.0,
+        help="DREAM exponent p in lambda_t = sqrt(1 - alpha_bar_t)^p (default 1.0, the paper's best)"
+        + " / DREAMの lambda_t = sqrt(1 - alpha_bar_t)^p の指数p（デフォルト1.0、論文での最良値）",
+    )
     # parser.add_argument(
     #     "--perlin_noise",
     #     type=int,
@@ -4315,12 +4338,27 @@ def enable_high_vram(args: argparse.Namespace):
         HIGH_VRAM = True
 
 
-def verify_training_args(args: argparse.Namespace):
+def verify_training_args(args: argparse.Namespace, supports_dream: bool = False):
     r"""
     Verify training arguments. Also reflect highvram option to global variable
     学習用引数を検証する。あわせて highvram オプションの指定をグローバル変数に反映する
     """
     enable_high_vram(args)
+
+    immiscible_k = getattr(args, "immiscible_noise_k", None)
+    if immiscible_k is not None:
+        if immiscible_k < 1:
+            raise ValueError("immiscible_noise_k must be >= 1 / immiscible_noise_kは1以上である必要があります")
+        if immiscible_k == 1:
+            logger.info("immiscible_noise_k=1 disables immiscible noise pairing / immiscible_noise_k=1のためimmiscible noise pairingは無効です")
+
+    if getattr(args, "dream_training", False) and not supports_dream:
+        raise ValueError(
+            "--dream_training is not supported by this script (use sdxl_train.py, sdxl_train_network.py or train_network.py)"
+            + " / このスクリプトは--dream_trainingに対応していません（sdxl_train.py、sdxl_train_network.py、train_network.pyを使用してください）"
+        )
+    if getattr(args, "dream_training", False) and getattr(args, "dream_detail_preservation", 1.0) < 0:
+        raise ValueError("dream_detail_preservation must be >= 0 / dream_detail_preservationは0以上である必要があります")
 
     if args.v2 and args.clip_skip is not None:
         logger.warning("v2 with clip_skip will be unexpected / v2でclip_skipを使用することは想定されていません")
@@ -5970,7 +6008,12 @@ def get_noise_noisy_latents_and_timesteps(
     args, noise_scheduler, latents: torch.FloatTensor
 ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.IntTensor]:
     # Sample noise that we'll add to the latents
-    noise = torch.randn_like(latents, device=latents.device)
+    immiscible_k = getattr(args, "immiscible_noise_k", None)
+    if immiscible_k is not None and immiscible_k > 1:
+        # immiscible pairing: pick the nearest of k noise candidates for each latent
+        noise = custom_train_functions.immiscible_knn_noise(latents, immiscible_k)
+    else:
+        noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
         if args.noise_offset_random_strength:
             noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
@@ -6001,6 +6044,61 @@ def get_noise_noisy_latents_and_timesteps(
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
     return noise, noisy_latents, timesteps
+
+
+@torch.no_grad()
+def apply_dream(
+    args,
+    noise_scheduler,
+    noise: torch.Tensor,
+    noisy_latents: torch.Tensor,
+    timesteps: torch.Tensor,
+    predict_fn,
+    keep_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    DREAM: Diffusion Rectification and Estimation-Adaptive Models (Zhou et al., CVPR 2024, arXiv 2312.00210).
+
+    Runs one extra no-grad forward pass and moves the training input/target toward the model's own
+    prediction, reducing the train/sampling mismatch (exposure bias):
+
+        lambda_t = sqrt(1 - alpha_bar_t) ** p
+        delta    = lambda_t * sg(noise - eps_hat)
+        x_t'     = x_t + sqrt(1 - alpha_bar_t) * delta
+        noise'   = noise + delta          (the target is built from noise' as usual)
+
+    eps_hat is the model output for eps-prediction; for v-prediction it is recovered as
+    eps_hat = sqrt(alpha_bar) * v_hat + sqrt(1 - alpha_bar) * x_t.
+
+    Args:
+        predict_fn: maps noisy latents (same shape as ``noisy_latents``) to the raw model output.
+        keep_mask: optional bool tensor (B,) of samples to leave unchanged (e.g. differential output preservation).
+
+    Returns:
+        (noise', noisy_latents'), with the dtypes of the inputs.
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod.cpu()
+    alpha_bar = alphas_cumprod[timesteps.cpu()].to(device=noisy_latents.device, dtype=torch.float32)
+    alpha_bar = alpha_bar.view(-1, *([1] * (noisy_latents.ndim - 1)))
+    sqrt_alpha_bar = alpha_bar.sqrt()
+    sqrt_one_minus_alpha_bar = (1.0 - alpha_bar).sqrt()
+
+    p = getattr(args, "dream_detail_preservation", 1.0)
+    dream_lambda = sqrt_one_minus_alpha_bar**p
+
+    model_output = predict_fn(noisy_latents).float()
+    if args.v_parameterization:
+        eps_hat = sqrt_alpha_bar * model_output + sqrt_one_minus_alpha_bar * noisy_latents.float()
+    else:
+        eps_hat = model_output
+
+    delta = dream_lambda * (noise.float() - eps_hat)
+    if keep_mask is not None:
+        delta = delta * (~keep_mask).to(delta.dtype).view(-1, *([1] * (delta.ndim - 1)))
+
+    new_noisy_latents = (noisy_latents.float() + sqrt_one_minus_alpha_bar * delta).to(noisy_latents.dtype)
+    new_noise = (noise.float() + delta).to(noise.dtype)
+    return new_noise, new_noisy_latents
 
 
 def get_huber_threshold_if_needed(args, timesteps: torch.Tensor, noise_scheduler) -> Optional[torch.Tensor]:

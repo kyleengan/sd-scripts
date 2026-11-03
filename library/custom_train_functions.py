@@ -484,6 +484,20 @@ def apply_noise_offset(latents, noise, noise_offset, adaptive_noise_scale) -> to
     return noise
 
 
+@torch.no_grad()
+def immiscible_knn_noise(latents: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    Immiscible noise pairing, KNN variant (Li et al., "Improved Immiscible Diffusion").
+    For each latent, sample k Gaussian noise candidates and return the one nearest (L2) to that latent.
+    Works per sample, so it is effective even with batch size 1.
+    """
+    b = latents.shape[0]
+    candidates = torch.randn((b, k, *latents.shape[1:]), device=latents.device, dtype=latents.dtype)
+    dist = (candidates.float() - latents.float().unsqueeze(1)).flatten(2).pow(2).sum(dim=-1)  # (B, k)
+    idx = dist.argmin(dim=1)
+    return candidates[torch.arange(b, device=latents.device), idx]
+
+
 def apply_masked_loss(loss, batch) -> torch.FloatTensor:
     if "conditioning_images" in batch:
         # conditioning image is -1 to 1. we need to convert it to 0 to 1

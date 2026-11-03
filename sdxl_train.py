@@ -97,7 +97,7 @@ def append_block_lr_to_logs(block_lrs, logs, lr_scheduler, optimizer_type):
 
 
 def train(args):
-    train_util.verify_training_args(args)
+    train_util.verify_training_args(args, supports_dream=True)
     train_util.prepare_dataset_args(args, True)
     sdxl_train_util.verify_sdxl_training_args(args)
     deepspeed_utils.prepare_deepspeed_args(args)
@@ -699,6 +699,17 @@ def train(args):
                 noise, noisy_latents, timesteps = train_util.get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents)
 
                 noisy_latents = noisy_latents.to(weight_dtype)  # TODO check why noisy_latents is not weight_dtype
+
+                # DREAM: rectify the noisy input / noise with the model's own (no-grad) prediction
+                if args.dream_training:
+
+                    def dream_predict(x):
+                        with accelerator.autocast():
+                            return unet(x, timesteps, text_embedding, vector_embedding)
+
+                    noise, noisy_latents = train_util.apply_dream(
+                        args, noise_scheduler, noise, noisy_latents, timesteps, dream_predict
+                    )
 
                 # Predict the noise residual
                 with accelerator.autocast():
